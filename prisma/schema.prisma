@@ -1,0 +1,316 @@
+// =====================================================================
+// Sistema de control de descuentos — Cafeterías Havanna
+// Esquema de datos v0.1 (borrador para revisión)
+//
+// Principios aplicados (Guía de Diseño del Holding):
+//  - Nada se borra: empleados se inhabilitan, credenciales se revocan,
+//    consumos se anulan. Todo queda en historial.
+//  - Reglas configurables como datos (porcentajes, sucursales), no en código.
+//  - Toda acción administrativa queda en la tabla de auditoría.
+// =====================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+// La URL de conexión vive en prisma.config.ts (Prisma 7).
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------
+
+enum EstadoBeneficiario {
+  ACTIVO
+  INHABILITADO
+}
+
+// "VENCIDA" no es un estado guardado: se calcula comparando vigenciaHasta
+// con la fecha actual. Así no hace falta un proceso que actualice estados.
+enum EstadoCredencial {
+  ACTIVA
+  REVOCADA
+}
+
+enum EstadoConsumo {
+  REGISTRADO
+  ANULADO
+}
+
+// Cómo se ingresó el código en la caja. Sirve para saber qué método
+// usa cada sucursal y para detectar abusos de la búsqueda por DNI.
+enum MetodoIngreso {
+  QR_CAMARA
+  LECTOR_USB
+  CODIGO_MANUAL
+  BUSQUEDA_DNI // empleado sin credencial a mano
+}
+
+enum MotivoRechazo {
+  CODIGO_INEXISTENTE
+  CREDENCIAL_VENCIDA
+  CREDENCIAL_REVOCADA
+  BENEFICIARIO_INHABILITADO
+  VIGENCIA_NO_INICIADA
+}
+
+enum RolAdmin {
+  ADMIN    // todo, incluida la configuración
+  RRHH     // beneficiarios y credenciales
+  CONSULTA // solo reportes
+}
+
+// ---------------------------------------------------------------------
+// CONFIGURACIÓN
+// ---------------------------------------------------------------------
+
+model Empresa {
+  id            Int            @id @default(autoincrement())
+  nombre        String         @unique // Holding, Correo Flash, Havanna...
+  activa        Boolean        @default(true)
+  creadoEn      DateTime       @default(now())
+  beneficiarios Beneficiario[]
+
+  @@map("empresas")
+}
+
+model Sucursal {
+  id           Int                    @id @default(autoincrement())
+  nombre       String                 @unique
+  direccion    String?
+  activa       Boolean                @default(true)
+  creadoEn     DateTime               @default(now())
+  operadores   OperadorSucursal[]
+  dispositivos Dispositivo[]
+  consumos     Consumo[]
+  rechazos     ValidacionRechazada[]
+
+  @@map("sucursales")
+}
+
+// Porcentajes configurables (10%, 15%, 20%...). Sumar uno nuevo es
+// cargar un dato, no tocar código.
+model TipoDescuento {
+  id            Int            @id @default(autoincrement())
+  nombre        String         @unique // ej: "Administrativo 20%"
+  porcentaje    Decimal        @db.Decimal(5, 2)
+  descripcion   String?
+  activo        Boolean        @default(true)
+  creadoEn      DateTime       @default(now())
+  beneficiarios Beneficiario[]
+
+  @@map("tipos_descuento")
+}
+
+// ---------------------------------------------------------------------
+// BENEFICIARIOS Y CREDENCIALES
+// ---------------------------------------------------------------------
+
+model Beneficiario {
+  id              Int                @id @default(autoincrement())
+  nombre          String
+  apellido        String
+  dni             String             @unique
+  email           String?
+  empresaId       Int
+  tipoDescuentoId Int
+  estado          EstadoBeneficiario @default(ACTIVO)
+  fechaAlta       DateTime           @default(now())
+  fechaBaja       DateTime?
+  motivoBaja      String?
+  actualizadoEn   DateTime           @updatedAt
+
+  empresa       Empresa       @relation(fields: [empresaId], references: [id])
+  tipoDescuento TipoDescuento @relation(fields: [tipoDescuentoId], references: [id])
+  credenciales  Credencial[]
+  consumos      Consumo[]
+
+  @@index([apellido, nombre])
+  @@map("beneficiarios")
+}
+
+// Renovar o regenerar una credencial crea un registro NUEVO y revoca el
+// anterior: así queda el historial completo de credenciales por persona.
+model Credencial {
+  id               Int              @id @default(autoincrement())
+  beneficiarioId   Int
+  // Token largo y aleatorio que va dentro del QR. No contiene datos
+  // personales; el sistema siempre valida contra la base.
+  token            String           @unique
+  // Código corto para tipear a mano (ej: HV-7K3P). Sin caracteres
+  // ambiguos (O/0, I/1/L).
+  codigoCorto      String           @unique
+  vigenciaDesde    DateTime
+  vigenciaHasta    DateTime
+  estado           EstadoCredencial @default(ACTIVA)
+  emitidaEn        DateTime         @default(now())
+  emitidaPorId     Int
+  revocadaEn       DateTime?
+  revocadaPorId    Int?
+  motivoRevocacion String?
+
+  beneficiario Beneficiario  @relation(fields: [beneficiarioId], references: [id])
+  emitidaPor   UsuarioAdmin  @relation("CredencialEmitida", fields: [emitidaPorId], references: [id])
+  revocadaPor  UsuarioAdmin? @relation("CredencialRevocada", fields: [revocadaPorId], references: [id])
+  consumos     Consumo[]
+
+  @@index([beneficiarioId])
+  @@map("credenciales")
+}
+
+// ---------------------------------------------------------------------
+// USUARIOS DEL SISTEMA
+// ---------------------------------------------------------------------
+
+// Administración y RRHH: entran desde Toolbox + login propio.
+// (Toolbox organiza el acceso pero no es barrera de seguridad.)
+model UsuarioAdmin {
+  id            Int       @id @default(autoincrement())
+  nombre        String
+  email         String    @unique
+  passwordHash  String
+  rol           RolAdmin
+  activo        Boolean   @default(true)
+  debeCambiarPw Boolean   @default(true) // contraseña temporal, como Toolbox
+  creadoEn      DateTime  @default(now())
+  ultimoAcceso  DateTime?
+
+  credencialesEmitidas  Credencial[]  @relation("CredencialEmitida")
+  credencialesRevocadas Credencial[]  @relation("CredencialRevocada")
+  consumosAnulados      Consumo[]     @relation("ConsumoAnulado")
+  dispositivosVinculados Dispositivo[]
+  auditoria             Auditoria[]
+
+  @@map("usuarios_admin")
+}
+
+// Encargadas y cajeras. No usan email ni contraseña: se identifican con
+// un PIN personal al confirmar cada descuento (hay rotación de personal
+// y la PC de caja es compartida).
+model Operador {
+  id         Int                @id @default(autoincrement())
+  nombre     String
+  apellido   String
+  pinHash    String
+  activo     Boolean            @default(true)
+  creadoEn   DateTime           @default(now())
+  sucursales OperadorSucursal[]
+  consumos   Consumo[]
+  rechazos   ValidacionRechazada[]
+
+  @@map("operadores")
+}
+
+// Sucursales en las que cada operador puede registrar descuentos.
+model OperadorSucursal {
+  operadorId Int
+  sucursalId Int
+  asignadoEn DateTime @default(now())
+
+  operador Operador @relation(fields: [operadorId], references: [id])
+  sucursal Sucursal @relation(fields: [sucursalId], references: [id])
+
+  @@id([operadorId, sucursalId])
+  @@map("operador_sucursal")
+}
+
+// PC o celular de caja vinculado a una sucursal. Un admin lo vincula una
+// vez; el navegador guarda un token y no hay que loguearse en cada uso.
+model Dispositivo {
+  id            Int       @id @default(autoincrement())
+  nombre        String    // ej: "PC caja Havanna Centro"
+  sucursalId    Int
+  tokenHash     String    @unique
+  activo        Boolean   @default(true)
+  vinculadoEn   DateTime  @default(now())
+  vinculadoPorId Int
+  ultimoUso     DateTime?
+
+  sucursal     Sucursal     @relation(fields: [sucursalId], references: [id])
+  vinculadoPor UsuarioAdmin @relation(fields: [vinculadoPorId], references: [id])
+  consumos     Consumo[]
+
+  @@map("dispositivos")
+}
+
+// ---------------------------------------------------------------------
+// OPERACIÓN
+// ---------------------------------------------------------------------
+
+model Consumo {
+  id               Int           @id @default(autoincrement())
+  nroOperacion     Int           @unique @default(autoincrement())
+  fechaHora        DateTime      @default(now())
+  sucursalId       Int
+  dispositivoId    Int
+  beneficiarioId   Int
+  credencialId     Int?          // null si se buscó por DNI sin credencial
+  operadorId       Int
+  metodoIngreso    MetodoIngreso
+  // Se copia el porcentaje vigente al momento del consumo: si después
+  // cambia el tipo de descuento del empleado, el historial no se altera.
+  porcentajeAplicado Decimal     @db.Decimal(5, 2)
+  // Pendiente de definición de Havanna (pregunta 5 del mail):
+  // si registran ticket y monto, o solo el uso.
+  nroTicket        String?
+  montoBruto       Decimal?      @db.Decimal(12, 2)
+  montoDescuento   Decimal?      @db.Decimal(12, 2)
+  observaciones    String?
+  estado           EstadoConsumo @default(REGISTRADO)
+  // Nunca se borra un consumo: se anula con motivo y responsable.
+  anuladoEn        DateTime?
+  anuladoPorId     Int?
+  motivoAnulacion  String?
+
+  sucursal     Sucursal      @relation(fields: [sucursalId], references: [id])
+  dispositivo  Dispositivo   @relation(fields: [dispositivoId], references: [id])
+  beneficiario Beneficiario  @relation(fields: [beneficiarioId], references: [id])
+  credencial   Credencial?   @relation(fields: [credencialId], references: [id])
+  operador     Operador      @relation(fields: [operadorId], references: [id])
+  anuladoPor   UsuarioAdmin? @relation("ConsumoAnulado", fields: [anuladoPorId], references: [id])
+
+  @@index([beneficiarioId, fechaHora])
+  @@index([sucursalId, fechaHora])
+  @@map("consumos")
+}
+
+// Intentos rechazados (credencial vencida, revocada, código inexistente).
+// Permite responder "¿quién intentó usar una credencial que no correspondía?".
+model ValidacionRechazada {
+  id              Int           @id @default(autoincrement())
+  fechaHora       DateTime      @default(now())
+  sucursalId      Int
+  operadorId      Int?
+  codigoIngresado String
+  metodoIngreso   MetodoIngreso
+  motivo          MotivoRechazo
+
+  sucursal Sucursal  @relation(fields: [sucursalId], references: [id])
+  operador Operador? @relation(fields: [operadorId], references: [id])
+
+  @@index([sucursalId, fechaHora])
+  @@map("validaciones_rechazadas")
+}
+
+// Toda acción administrativa: altas, bajas, cambios de porcentaje,
+// emisión/revocación de credenciales, anulaciones, cambios de config.
+model Auditoria {
+  id          Int          @id @default(autoincrement())
+  fechaHora   DateTime     @default(now())
+  usuarioId   Int
+  accion      String       // ej: "BENEFICIARIO_INHABILITADO"
+  entidad     String       // ej: "Beneficiario"
+  entidadId   Int
+  datosAntes  Json?
+  datosDespues Json?
+  ip          String?
+
+  usuario UsuarioAdmin @relation(fields: [usuarioId], references: [id])
+
+  @@index([entidad, entidadId])
+  @@index([fechaHora])
+  @@map("auditoria")
+}
